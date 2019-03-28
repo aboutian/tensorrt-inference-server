@@ -377,12 +377,6 @@ class InferContextImpl : public InferContext {
  protected:
   Error Init(std::unique_ptr<ServerStatusContext> sctx);
 
-  // Function for worker thread to proceed the data transfer for all requests
-  virtual void AsyncTransfer() = 0;
-
-  // Helper function called before inference to prepare 'request'
-  virtual Error PreRunProcessing(std::shared_ptr<Request>& request) = 0;
-
   // Helper function called by GetAsyncRunResults() to check if the request
   // is ready. If the request is valid and wait == true,
   // the function will block until request is ready.

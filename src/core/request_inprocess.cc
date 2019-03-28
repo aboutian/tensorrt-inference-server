@@ -1,4 +1,4 @@
-// Copyright (c) 2018-2019, NVIDIA CORPORATION. All rights reserved.
+// Copyright (c) 2019, NVIDIA CORPORATION. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -24,49 +24,78 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#include "src/clients/c++/request_grpc.h"
+#include "src/core/request_inprocess.h"
 
-#include <grpcpp/grpcpp.h>
 #include "src/clients/c++/request_common.h"
-#include "src/core/grpc_service.grpc.pb.h"
-#include "src/core/grpc_service.pb.h"
-#include "src/core/model_config.pb.h"
+#include "src/core/logging.h"
+#include "src/core/server.h"
 
 namespace nvidia { namespace inferenceserver { namespace client {
 
-class InferGrpcContextImpl;
+//==============================================================================
 
 namespace {
 
-//==============================================================================
+class ServerOptionsImpl : public InferenceServerContext::Options {
+ public:
+  const std::string& ModelRepositoryPath() const;
+  void SetModelRepositoryPath(const std::string& path) override;
 
-// Use map to keep track of GRPC channels. <key, value> : <url, Channel*>
-// If context is created on url that has established Channel, then reuse it.
-std::map<std::string, std::shared_ptr<grpc::Channel>> grpc_channel_map_;
-std::shared_ptr<grpc::Channel>
-GetChannel(const std::string& url)
+ private:
+  std::string model_repository_path_;
+};
+
+const std::string&
+ServerOptionsImpl::ModelRepositoryPath() const
 {
-  const auto& channel_itr = grpc_channel_map_.find(url);
-  if (channel_itr != grpc_channel_map_.end()) {
-    return channel_itr->second;
-  } else {
-    grpc::ChannelArguments arguments;
-    arguments.SetMaxSendMessageSize(MAX_GRPC_MESSAGE_SIZE);
-    arguments.SetMaxReceiveMessageSize(MAX_GRPC_MESSAGE_SIZE);
-    std::shared_ptr<grpc::Channel> channel = grpc::CreateCustomChannel(
-        url, grpc::InsecureChannelCredentials(), arguments);
-    grpc_channel_map_.insert(std::make_pair(url, channel));
-    return channel;
-  }
+  return model_repository_path_;
+}
+
+void
+ServerOptionsImpl::SetModelRepositoryPath(const std::string& path)
+{
+  model_repository_path_ = path;
 }
 
 }  // namespace
 
+InferenceServerContext::Options::~Options() {}
+
+Error
+InferenceServerContext::Options::Create(std::unique_ptr<Options>* options)
+{
+  options->reset(new ServerOptionsImpl());
+  return Error::Success;
+}
+
+Error
+InferenceServerContext::Create(
+    std::unique_ptr<InferenceServerContext>* ctx,
+    const std::unique_ptr<Options>& options)
+{
+  ServerOptionsImpl* options_impl =
+      dynamic_cast<ServerOptionsImpl*>(options.get());
+
+  InferenceServer* server = new InferenceServer();
+
+  server->SetModelStorePath(options_impl->ModelRepositoryPath());
+
+  if (!server->Init()) {
+    return Error(
+        RequestStatusCode::INVALID_ARG,
+        "Failed to initialize inference server");
+  }
+
+  ctx->reset(reinterpret_cast<InferenceServerContext*>(server));
+
+  return Error::Success;
+}
+
 //==============================================================================
 
-class ServerHealthGrpcContextImpl : public ServerHealthContext {
+class ServerHealthInProcessContextImpl : public ServerHealthContext {
  public:
-  ServerHealthGrpcContextImpl(const std::string& url, bool verbose);
+  ServerHealthInProcessContextImpl(InferenceServer* server, bool verbose);
 
   Error GetReady(bool* ready) override;
   Error GetLive(bool* live) override;
@@ -74,223 +103,175 @@ class ServerHealthGrpcContextImpl : public ServerHealthContext {
  private:
   Error GetHealth(const std::string& mode, bool* health);
 
-  // GRPC end point.
-  std::unique_ptr<GRPCService::Stub> stub_;
-
-  // Enable verbose output
+  InferenceServer* const server_;
   const bool verbose_;
 };
 
-ServerHealthGrpcContextImpl::ServerHealthGrpcContextImpl(
-    const std::string& url, bool verbose)
-    : stub_(GRPCService::NewStub(GetChannel(url))), verbose_(verbose)
+ServerHealthInProcessContextImpl::ServerHealthInProcessContextImpl(
+    InferenceServer* server, bool verbose)
+    : server_(server), verbose_(verbose)
 {
 }
 
 Error
-ServerHealthGrpcContextImpl::GetHealth(const std::string& mode, bool* health)
+ServerHealthInProcessContextImpl::GetHealth(
+    const std::string& mode, bool* health)
 {
-  Error err;
+  RequestStatus request_status;
+  server_->HandleHealth(&request_status, health, mode);
 
-  HealthRequest request;
-  HealthResponse response;
-  grpc::ClientContext context;
-
-  request.set_mode(mode);
-  grpc::Status grpc_status = stub_->Health(&context, request, &response);
-  if (grpc_status.ok()) {
-    *health = response.health();
-    err = Error(response.request_status());
-  } else {
-    // Something wrong with the GRPC connection
-    err = Error(
-        RequestStatusCode::INTERNAL,
-        "GRPC client failed: " + std::to_string(grpc_status.error_code()) +
-            ": " + grpc_status.error_message());
+  if (verbose_) {
+    if (request_status.code() != RequestStatusCode::SUCCESS) {
+      LOG_ERROR << "server health failed, " << mode << ": "
+                << request_status.ShortDebugString();
+    } else {
+      LOG_INFO << "server health, " << mode << ": " << *health;
+    }
   }
 
-  if (verbose_ && err.IsOk()) {
-    std::cout << mode << ": " << *health << std::endl;
-  }
-
-  return err;
+  return Error(request_status);
 }
 
 Error
-ServerHealthGrpcContextImpl::GetReady(bool* ready)
+ServerHealthInProcessContextImpl::GetReady(bool* ready)
 {
   return GetHealth("ready", ready);
 }
 
 Error
-ServerHealthGrpcContextImpl::GetLive(bool* live)
+ServerHealthInProcessContextImpl::GetLive(bool* live)
 {
   return GetHealth("live", live);
 }
 
 Error
-ServerHealthGrpcContext::Create(
-    std::unique_ptr<ServerHealthContext>* ctx, const std::string& server_url,
-    bool verbose)
+ServerHealthInProcessContext::Create(
+    std::unique_ptr<ServerHealthContext>* ctx,
+    const std::unique_ptr<InferenceServerContext>& server_ctx, bool verbose)
 {
+  InferenceServer* server =
+      reinterpret_cast<InferenceServer*>(server_ctx.get());
   ctx->reset(static_cast<ServerHealthContext*>(
-      new ServerHealthGrpcContextImpl(server_url, verbose)));
+      new ServerHealthInProcessContextImpl(server, verbose)));
   return Error::Success;
 }
 
 //==============================================================================
 
-class ServerStatusGrpcContextImpl : public ServerStatusContext {
+class ServerStatusInProcessContextImpl : public ServerStatusContext {
  public:
-  ServerStatusGrpcContextImpl(const std::string& url, bool verbose);
-  ServerStatusGrpcContextImpl(
-      const std::string& url, const std::string& model_name, bool verbose);
+  ServerStatusInProcessContextImpl(
+      InferenceServer* server, const std::string& model_name, bool verbose);
   Error GetServerStatus(ServerStatus* status) override;
 
  private:
-  // Model name
+  InferenceServer* const server_;
   const std::string model_name_;
-
-  // GRPC end point.
-  std::unique_ptr<GRPCService::Stub> stub_;
-
-  // Enable verbose output
   const bool verbose_;
 };
 
-ServerStatusGrpcContextImpl::ServerStatusGrpcContextImpl(
-    const std::string& url, bool verbose)
-    : model_name_(""), stub_(GRPCService::NewStub(GetChannel(url))),
-      verbose_(verbose)
-{
-}
-
-ServerStatusGrpcContextImpl::ServerStatusGrpcContextImpl(
-    const std::string& url, const std::string& model_name, bool verbose)
-    : model_name_(model_name), stub_(GRPCService::NewStub(GetChannel(url))),
-      verbose_(verbose)
+ServerStatusInProcessContextImpl::ServerStatusInProcessContextImpl(
+    InferenceServer* server, const std::string& model_name, bool verbose)
+    : server_(server), model_name_(model_name), verbose_(verbose)
 {
 }
 
 Error
-ServerStatusGrpcContextImpl::GetServerStatus(ServerStatus* server_status)
+ServerStatusInProcessContextImpl::GetServerStatus(ServerStatus* server_status)
 {
   server_status->Clear();
 
-  Error grpc_status;
+  RequestStatus request_status;
+  server_->HandleStatus(&request_status, server_status, model_name_);
 
-  StatusRequest request;
-  StatusResponse response;
-  grpc::ClientContext context;
-
-  request.set_model_name(model_name_);
-  grpc::Status status = stub_->Status(&context, request, &response);
-  if (status.ok()) {
-    server_status->Swap(response.mutable_server_status());
-    grpc_status = Error(response.request_status());
-  } else {
-    // Something wrong with the GRPC conncection
-    grpc_status = Error(
-        RequestStatusCode::INTERNAL,
-        "GRPC client failed: " + std::to_string(status.error_code()) + ": " +
-            status.error_message());
+  if (verbose_) {
+    if (request_status.code() != RequestStatusCode::SUCCESS) {
+      LOG_ERROR << "server status failed: "
+                << request_status.ShortDebugString();
+    } else {
+      LOG_INFO << "server status: " << server_status->DebugString();
+    }
   }
 
-  // Log server status if request is SUCCESS and verbose is true.
-  if (grpc_status.IsOk() && verbose_) {
-    std::cout << server_status->DebugString() << std::endl;
-  }
-  return grpc_status;
+  return Error(request_status);
 }
 
 Error
-ServerStatusGrpcContext::Create(
-    std::unique_ptr<ServerStatusContext>* ctx, const std::string& server_url,
-    bool verbose)
+ServerStatusInProcessContext::Create(
+    std::unique_ptr<ServerStatusContext>* ctx,
+    const std::unique_ptr<InferenceServerContext>& server_ctx, bool verbose)
 {
+  InferenceServer* server =
+      reinterpret_cast<InferenceServer*>(server_ctx.get());
   ctx->reset(static_cast<ServerStatusContext*>(
-      new ServerStatusGrpcContextImpl(server_url, verbose)));
+      new ServerStatusInProcessContextImpl(server, "", verbose)));
   return Error::Success;
 }
 
 Error
-ServerStatusGrpcContext::Create(
-    std::unique_ptr<ServerStatusContext>* ctx, const std::string& server_url,
+ServerStatusInProcessContext::Create(
+    std::unique_ptr<ServerStatusContext>* ctx,
+    const std::unique_ptr<InferenceServerContext>& server_ctx,
     const std::string& model_name, bool verbose)
 {
+  InferenceServer* server =
+      reinterpret_cast<InferenceServer*>(server_ctx.get());
   ctx->reset(static_cast<ServerStatusContext*>(
-      new ServerStatusGrpcContextImpl(server_url, model_name, verbose)));
+      new ServerStatusInProcessContextImpl(server, model_name, verbose)));
   return Error::Success;
 }
 
 //==============================================================================
 
-class ProfileGrpcContextImpl : public ProfileContext {
+class InferInProcessContextImpl : public InferContextImpl {
  public:
-  ProfileGrpcContextImpl(const std::string& url, bool verbose);
-  Error StartProfile() override;
-  Error StopProfile() override;
+  InferInProcessContextImpl(
+      InferenceServer* server, CorrelationID correlation_id,
+      const std::string& model_name, int64_t model_version, bool verbose);
+
+  virtual Error Run(ResultMap* results) override;
+  virtual Error AsyncRun(std::shared_ptr<Request>* async_request) override;
+  Error GetAsyncRunResults(
+      ResultMap* results, bool* is_ready,
+      const std::shared_ptr<Request>& async_request, bool wait) override;
 
  private:
-  Error SendCommand(const std::string& cmd_str);
-
-  // GRPC end point.
-  std::unique_ptr<GRPCService::Stub> stub_;
-
-  // Enable verbose output
-  const bool verbose_;
+  InferenceServer* const server_;
 };
 
-ProfileGrpcContextImpl::ProfileGrpcContextImpl(
-    const std::string& url, bool verbose)
-    : stub_(GRPCService::NewStub(GetChannel(url))), verbose_(verbose)
+InferInProcessContextImpl::InferInProcessContextImpl(
+    InferenceServer* server, CorrelationID correlation_id,
+    const std::string& model_name, int64_t model_version, bool verbose)
+    : InferContextImpl(model_name, model_version, correlation_id, verbose),
+      server_(server)
 {
 }
 
 Error
-ProfileGrpcContextImpl::StartProfile()
+InferInProcessContextImpl::AsyncRun(std::shared_ptr<Request>* async_request)
 {
-  return SendCommand("start");
+  return Error(
+      RequestStatusCode::UNSUPPORTED,
+      "AsyncRun not supported for in-process API");
 }
 
 Error
-ProfileGrpcContextImpl::StopProfile()
+InferInProcessContextImpl::GetAsyncRunResults(
+    ResultMap* results, bool* is_ready,
+    const std::shared_ptr<Request>& async_request, bool wait)
 {
-  return SendCommand("stop");
+  return Error(
+      RequestStatusCode::UNSUPPORTED,
+      "GetAsyncRunResults not supported for in-process API");
 }
 
 Error
-ProfileGrpcContextImpl::SendCommand(const std::string& cmd_str)
+InferInProcessContextImpl::Run(ResultMap* results)
 {
-  ProfileRequest request;
-  ProfileResponse response;
-  grpc::ClientContext context;
-
-  request.set_cmd(cmd_str);
-  grpc::Status status = stub_->Profile(&context, request, &response);
-  if (status.ok()) {
-    return Error(response.request_status());
-  } else {
-    // Something wrong with the GRPC conncection
-    return Error(
-        RequestStatusCode::INTERNAL,
-        "GRPC client failed: " + std::to_string(status.error_code()) + ": " +
-            status.error_message());
-  }
-}
-
-Error
-ProfileGrpcContext::Create(
-    std::unique_ptr<ProfileContext>* ctx, const std::string& server_url,
-    bool verbose)
-{
-  ctx->reset(static_cast<ProfileContext*>(
-      new ProfileGrpcContextImpl(server_url, verbose)));
   return Error::Success;
 }
 
-//==============================================================================
-
+#if 0
 class GrpcRequestImpl : public RequestImpl {
  public:
   GrpcRequestImpl(const uint64_t id);
@@ -328,8 +309,8 @@ class InferGrpcContextImpl : public InferContextImpl {
       const std::shared_ptr<Request>& async_request, bool wait) override;
 
  protected:
-  virtual void AsyncTransfer();
-  Error PreRunProcessing(std::shared_ptr<Request>& request);
+  virtual void AsyncTransfer() override;
+  Error PreRunProcessing(std::shared_ptr<Request>& request) override;
 
   // The producer-consumer queue used to communicate asynchronously with
   // the GRPC runtime.
@@ -697,169 +678,33 @@ InferGrpcContext::Create(
       verbose);
 }
 
-Error
-InferGrpcContext::Create(
-    std::unique_ptr<InferContext>* ctx, CorrelationID correlation_id,
-    const std::string& server_url, const std::string& model_name,
-    int64_t model_version, bool verbose)
-{
-  InferGrpcContextImpl* ctx_ptr = new InferGrpcContextImpl(
-      server_url, model_name, model_version, correlation_id, verbose);
-  ctx->reset(static_cast<InferContext*>(ctx_ptr));
-
-  Error err = ctx_ptr->InitGrpc(server_url);
-  if (!err.IsOk()) {
-    ctx->reset();
-  }
-
-  return err;
-}
-
-//==============================================================================
-
-class InferGrpcStreamContextImpl : public InferGrpcContextImpl {
- public:
-  InferGrpcStreamContextImpl(
-      const std::string&, const std::string&, int64_t, CorrelationID, bool);
-  virtual ~InferGrpcStreamContextImpl();
-
-  Error Run(ResultMap* results) override;
-  Error AsyncRun(std::shared_ptr<Request>* async_request) override;
-
- private:
-  void AsyncTransfer() override;
-
-  // gRPC objects for using the streaming API
-  grpc::ClientContext context_;
-  std::shared_ptr<grpc::ClientReaderWriter<InferRequest, InferResponse>>
-      stream_;
-};
-
-InferGrpcStreamContextImpl::InferGrpcStreamContextImpl(
-    const std::string& server_url, const std::string& model_name,
-    int64_t model_version, CorrelationID correlation_id, bool verbose)
-    : InferGrpcContextImpl(
-          server_url, model_name, model_version, correlation_id, verbose)
-{
-  stream_ = stub_->StreamInfer(&context_);
-  // Initiate worker thread to read constantly
-  worker_ = std::thread(&InferGrpcStreamContextImpl::AsyncTransfer, this);
-}
-
-InferGrpcStreamContextImpl::~InferGrpcStreamContextImpl()
-{
-  exiting_ = true;
-  stream_->WritesDone();
-  // The reader thread will drain the stream properly
-  worker_.join();
-}
+#endif
 
 Error
-InferGrpcStreamContextImpl::Run(ResultMap* results)
-{
-  // Actually calling AsyncRun() and GetAsyncRunResults()
-  std::shared_ptr<Request> req;
-  Error err = AsyncRun(&req);
-  if (!err.IsOk()) {
-    return err;
-  }
-  bool is_ready;
-  return GetAsyncRunResults(results, &is_ready, req, true);
-}
-
-Error
-InferGrpcStreamContextImpl::AsyncRun(std::shared_ptr<Request>* async_request)
-{
-  GrpcRequestImpl* current_context = new GrpcRequestImpl(async_request_id_++);
-  async_request->reset(static_cast<Request*>(current_context));
-
-  uintptr_t run_index = current_context->Id();
-  auto insert_result = ongoing_async_requests_.emplace(
-      std::make_pair(run_index, *async_request));
-
-  if (!insert_result.second) {
-    return Error(
-        RequestStatusCode::INTERNAL,
-        "Failed to insert new asynchronous request context.");
-  }
-
-  current_context->Timer().Reset();
-  current_context->Timer().Record(RequestTimers::Kind::SEND_START);
-  PreRunProcessing(*async_request);
-  current_context->Timer().Record(RequestTimers::Kind::SEND_END);
-
-  current_context->Timer().Record(RequestTimers::Kind::REQUEST_START);
-  bool ok = stream_->Write(request_);
-
-  if (ok) {
-    return Error::Success;
-  } else {
-    return Error(RequestStatusCode::INTERNAL, "Stream has been closed.");
-  }
-}
-
-void
-InferGrpcStreamContextImpl::AsyncTransfer()
-{
-  InferResponse response;
-  // End loop if Read() returns false
-  // (stream ended and all responses are drained)
-  while (stream_->Read(&response)) {
-    if (exiting_) {
-      continue;
-    }
-
-    // Get request ID
-    uintptr_t run_index = response.meta_data().id();
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      auto itr = ongoing_async_requests_.find(run_index);
-      if (itr == ongoing_async_requests_.end()) {
-        fprintf(
-            stderr,
-            "Unexpected error: received completed request that"
-            " is not in the list of asynchronous requests.\n");
-        continue;
-      }
-
-      std::shared_ptr<GrpcRequestImpl> grpc_request =
-          std::static_pointer_cast<GrpcRequestImpl>(itr->second);
-      grpc_request->grpc_response_.Swap(&response);
-      grpc_request->Timer().Record(RequestTimers::Kind::REQUEST_END);
-      grpc_request->SetIsReady(true);
-    }
-    // send signal in case the main thread is waiting for response
-    cv_.notify_all();
-  }
-  stream_->Finish();
-}
-
-Error
-InferGrpcStreamContext::Create(
-    std::unique_ptr<InferContext>* ctx, const std::string& server_url,
+InferInProcessContext::Create(
+    std::unique_ptr<InferContext>* ctx,
+    const std::unique_ptr<InferenceServerContext>& server_ctx,
     const std::string& model_name, int64_t model_version, bool verbose)
 {
-  return Create(
-      ctx, 0 /* correlation_id */, server_url, model_name, model_version,
-      verbose);
+  InferenceServer* server =
+      reinterpret_cast<InferenceServer*>(server_ctx.get());
+  ctx->reset(static_cast<InferContext*>(new InferInProcessContextImpl(
+      server, 0 /* correlation_id */, model_name, model_version, verbose)));
+  return Error::Success;
 }
 
 Error
-InferGrpcStreamContext::Create(
-    std::unique_ptr<InferContext>* ctx, CorrelationID correlation_id,
-    const std::string& server_url, const std::string& model_name,
+InferInProcessContext::Create(
+    std::unique_ptr<InferContext>* ctx,
+    const std::unique_ptr<InferenceServerContext>& server_ctx,
+    CorrelationID correlation_id, const std::string& model_name,
     int64_t model_version, bool verbose)
 {
-  InferGrpcStreamContextImpl* ctx_ptr = new InferGrpcStreamContextImpl(
-      server_url, model_name, model_version, correlation_id, verbose);
-  ctx->reset(static_cast<InferContext*>(ctx_ptr));
-
-  Error err = ctx_ptr->InitGrpc(server_url);
-  if (!err.IsOk()) {
-    ctx->reset();
-  }
-
-  return err;
+  InferenceServer* server =
+      reinterpret_cast<InferenceServer*>(server_ctx.get());
+  ctx->reset(static_cast<InferContext*>(new InferInProcessContextImpl(
+      server, correlation_id, model_name, model_version, verbose)));
+  return Error::Success;
 }
 
 }}}  // namespace nvidia::inferenceserver::client
